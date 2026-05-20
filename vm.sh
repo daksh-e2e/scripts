@@ -12,7 +12,7 @@
 #   E2E_SITE=obs.e2enetworks.net — override the default API endpoint
 #
 # Supports: AlmaLinux/RHEL 8+, Ubuntu 20.04+, Debian 11+
-# Requires: curl, docker, systemd, root or sudo
+# Requires: curl, podman or docker, systemd, root or sudo
 # =============================================================================
 
 set -euo pipefail
@@ -51,7 +51,16 @@ require_cmd() {
 
 require_cmd curl
 require_cmd systemctl
-require_cmd docker
+
+# Auto-detect container runtime: prefer podman (RHEL/AlmaLinux), fall back to docker
+if command -v podman >/dev/null 2>&1; then
+    CONTAINER_RUNTIME="podman"
+elif command -v docker >/dev/null 2>&1; then
+    CONTAINER_RUNTIME="docker"
+else
+    die "Neither 'podman' nor 'docker' is installed. Please install one and retry."
+fi
+log "Using container runtime: ${CONTAINER_RUNTIME}"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
@@ -100,7 +109,7 @@ ok "  Log group  : ${LOG_GROUP}"
 # ── Step 3: Pull collector image ──────────────────────────────────────────────
 log "Step 3/5 — Pulling e2e-otel-collector image..."
 
-docker pull "${COLLECTOR_IMAGE}" || die "Failed to pull collector image from registry."
+${CONTAINER_RUNTIME} pull "${COLLECTOR_IMAGE}" || die "Failed to pull collector image from registry."
 
 ok "Image pulled: ${COLLECTOR_IMAGE%%@*}"
 
@@ -273,16 +282,27 @@ ok "Configuration written to ${INSTALL_DIR}/"
 # ── Step 5: Create and start systemd service ──────────────────────────────────
 log "Step 5/5 — Installing systemd service..."
 
-# Remove any old container so the service can always docker run fresh
-docker rm -f "${SERVICE_NAME}" 2>/dev/null || true
+# Remove any old container so the service can always start fresh
+${CONTAINER_RUNTIME} rm -f "${SERVICE_NAME}" 2>/dev/null || true
+
+RUNTIME_BIN=$(command -v "${CONTAINER_RUNTIME}")
+
+# Build the After/Requires lines — podman needs no docker.service dependency
+if [[ "${CONTAINER_RUNTIME}" == "docker" ]]; then
+    UNIT_AFTER="network-online.target docker.service"
+    UNIT_REQUIRES="Requires=docker.service"
+else
+    UNIT_AFTER="network-online.target"
+    UNIT_REQUIRES=""
+fi
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=E2E Observability Agent
 Documentation=https://docs.e2enetworks.com/observability
-After=network-online.target docker.service
+After=${UNIT_AFTER}
 Wants=network-online.target
-Requires=docker.service
+${UNIT_REQUIRES}
 
 [Service]
 Type=simple
@@ -291,8 +311,8 @@ Restart=on-failure
 RestartSec=5s
 StartLimitIntervalSec=60
 StartLimitBurst=3
-ExecStartPre=-/usr/bin/docker rm -f ${SERVICE_NAME}
-ExecStart=/usr/bin/docker run --rm --name ${SERVICE_NAME} \
+ExecStartPre=-${RUNTIME_BIN} rm -f ${SERVICE_NAME}
+ExecStart=${RUNTIME_BIN} run --rm --name ${SERVICE_NAME} \
   --env-file ${INSTALL_DIR}/env \
   --network host \
   --pid host \
@@ -301,7 +321,7 @@ ExecStart=/usr/bin/docker run --rm --name ${SERVICE_NAME} \
   -v /var/log:/var/log:ro \
   -v /run/log/journal:/run/log/journal:ro \
   ${COLLECTOR_IMAGE}
-ExecStop=/usr/bin/docker stop ${SERVICE_NAME}
+ExecStop=${RUNTIME_BIN} stop ${SERVICE_NAME}
 
 [Install]
 WantedBy=multi-user.target
