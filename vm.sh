@@ -155,30 +155,6 @@ extensions:
       directory: /var/lib/e2e-otel-collector/tmp
 
 receivers:
-  journald:
-    directory: /run/log/journal
-    priority: info
-    operators:
-      - type: copy
-        from: body.SYSLOG_IDENTIFIER
-        to: attributes["service.name"]
-        if: 'body["SYSLOG_IDENTIFIER"] != nil'
-      - type: copy
-        from: body.PRIORITY
-        to: attributes["syslog.priority"]
-        if: 'body["PRIORITY"] != nil'
-      - type: copy
-        from: body._SYSTEMD_UNIT
-        to: attributes["systemd.unit"]
-        if: 'body["_SYSTEMD_UNIT"] != nil'
-      - type: move
-        from: body.MESSAGE
-        to: body
-        if: 'body["MESSAGE"] != nil'
-      - type: add
-        field: resource["host.name"]
-        value: "${env:HOST_NAME}"
-
   filelog/syslog:
     include:
       - /var/log/messages
@@ -279,7 +255,7 @@ service:
       processors: [memory_limiter, resource/node, batch]
       exporters: [otlp/gateway]
     logs:
-      receivers: [journald, filelog/syslog, filelog/app]
+      receivers: [filelog/syslog, filelog/app]
       processors: [memory_limiter, resource/node, batch]
       exporters: [otlp/gateway]
 YAML
@@ -292,6 +268,9 @@ log "Step 5/5 — Installing systemd service..."
 
 # Remove any old container so the service can always start fresh
 ${CONTAINER_RUNTIME} rm -f "${SERVICE_NAME}" 2>/dev/null || true
+
+# The collector image runs as UID 65532 (nonroot) — ensure it can write to the data dir
+chown -R 65532:65532 "$DATA_DIR" 2>/dev/null || true
 
 RUNTIME_BIN=$(command -v "${CONTAINER_RUNTIME}")
 
@@ -328,7 +307,7 @@ ExecStart=${RUNTIME_BIN} run --rm --name ${SERVICE_NAME} \
   -v ${DATA_DIR}:/var/lib/e2e-otel-collector \
   -v /var/log:/var/log:ro \
   -v /run/log/journal:/run/log/journal:ro \
-  ${COLLECTOR_IMAGE}
+  ${COLLECTOR_IMAGE} --config=/etc/otelcol/config.yaml
 ExecStop=${RUNTIME_BIN} stop ${SERVICE_NAME}
 
 [Install]
