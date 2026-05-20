@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 E2E_SITE="${E2E_SITE:-obs.e2enetworks.net}"
-API_BASE="https://${E2E_SITE}"
+API_BASE="${E2E_API_BASE:-https://${E2E_SITE}}"
 INSTALL_DIR="/etc/e2e-otel-collector"
 DATA_DIR="/var/lib/e2e-otel-collector"
 SERVICE_NAME="e2e-otel-collector"
