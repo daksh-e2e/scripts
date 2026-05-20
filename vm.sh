@@ -82,7 +82,7 @@ ok "Platform: ${OS_ID:-linux} / $(uname -m)"
 # ── Step 2: Register with E2E Observability API ───────────────────────────────
 log "Step 2/5 — Registering with E2E Observability..."
 
-REGISTER_RESPONSE=$(curl -sf \
+REGISTER_RESPONSE=$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors \
     -X POST \
     -H "Content-Type: application/json" \
     -d "{\"api_key\": \"${E2E_API_KEY}\", \"project_id\": ${E2E_PROJECT_ID}, \"customer_id\": ${E2E_CUSTOMER_ID}, \"resource_type\": \"vm\"}" \
