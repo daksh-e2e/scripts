@@ -109,6 +109,14 @@ ok "  Log group  : ${LOG_GROUP}"
 # ── Step 3: Pull collector image ──────────────────────────────────────────────
 log "Step 3/5 — Pulling e2e-otel-collector image..."
 
+# Optional registry auth — set E2E_REGISTRY_USER and E2E_REGISTRY_PASS if the registry is private
+if [[ -n "${E2E_REGISTRY_USER:-}" && -n "${E2E_REGISTRY_PASS:-}" ]]; then
+    echo "${E2E_REGISTRY_PASS}" | ${CONTAINER_RUNTIME} login registry.e2enetworks.net \
+        -u "${E2E_REGISTRY_USER}" --password-stdin >/dev/null \
+        || die "Registry login failed. Check E2E_REGISTRY_USER / E2E_REGISTRY_PASS."
+    log "Registry login successful"
+fi
+
 ${CONTAINER_RUNTIME} pull "${COLLECTOR_IMAGE}" || die "Failed to pull collector image from registry."
 
 ok "Image pulled: ${COLLECTOR_IMAGE%%@*}"
