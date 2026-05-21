@@ -12,7 +12,7 @@
 #   E2E_SITE=obs.e2enetworks.net — override the default API endpoint
 #
 # Supports: AlmaLinux/RHEL 8+, Ubuntu 20.04+, Debian 11+
-# Requires: curl, podman or docker, systemd, root or sudo
+# Requires: curl, docker, systemd, root or sudo
 # =============================================================================
 
 set -euo pipefail
@@ -52,15 +52,97 @@ require_cmd() {
 require_cmd curl
 require_cmd systemctl
 
-# Auto-detect container runtime: prefer podman (RHEL/AlmaLinux), fall back to docker
-if command -v podman >/dev/null 2>&1; then
-    CONTAINER_RUNTIME="podman"
-elif command -v docker >/dev/null 2>&1; then
-    CONTAINER_RUNTIME="docker"
-else
-    die "Neither 'podman' nor 'docker' is installed. Please install one and retry."
+# ── Step 0: Detect OS ─────────────────────────────────────────────────────────
+OS_ID=""
+OS_ID_LIKE=""
+OS_VERSION_ID=""
+if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    OS_ID=$(. /etc/os-release && echo "${ID}")
+    OS_ID_LIKE=$(. /etc/os-release && echo "${ID_LIKE:-}")
+    OS_VERSION_ID=$(. /etc/os-release && echo "${VERSION_ID:-}")
 fi
-log "Using container runtime: ${CONTAINER_RUNTIME}"
+
+# ── Install Docker if missing ──────────────────────────────────────────────────
+install_docker() {
+    log "Docker not found — installing Docker Engine..."
+
+    # Determine OS family
+    local family=""
+    case "${OS_ID}" in
+        rhel|almalinux|rocky|centos|fedora) family="rhel" ;;
+        ubuntu)                              family="ubuntu" ;;
+        debian)                              family="debian" ;;
+        *)
+            # Fall back to ID_LIKE
+            if echo "${OS_ID_LIKE}" | grep -qE 'rhel|centos|fedora'; then
+                family="rhel"
+            elif echo "${OS_ID_LIKE}" | grep -q 'debian'; then
+                family="debian"
+            else
+                die "Unsupported OS '${OS_ID}'. Install Docker manually and re-run this script."
+            fi
+            ;;
+    esac
+
+    case "${family}" in
+        rhel)
+            log "Installing Docker via dnf (RHEL/AlmaLinux/CentOS/Rocky)..."
+            dnf -y install dnf-plugins-core 2>/dev/null || yum -y install yum-utils
+            # CentOS 7/8 repo works for RHEL-family; use centos as base URL
+            dnf config-manager --add-repo \
+                https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null \
+                || yum-config-manager --add-repo \
+                https://download.docker.com/linux/centos/docker-ce.repo
+            dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+                2>/dev/null || yum -y install docker-ce docker-ce-cli containerd.io
+            ;;
+        ubuntu)
+            log "Installing Docker via apt (Ubuntu)..."
+            apt-get update -qq
+            apt-get install -y -qq ca-certificates curl gnupg lsb-release
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu \
+$(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
+                | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update -qq
+            apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
+            ;;
+        debian)
+            log "Installing Docker via apt (Debian)..."
+            apt-get update -qq
+            apt-get install -y -qq ca-certificates curl gnupg
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/debian/gpg \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/debian \
+$(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
+                | tee /etc/apt/sources.list.d/docker.list > /dev/null
+            apt-get update -qq
+            apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
+            ;;
+    esac
+
+    systemctl enable docker --quiet
+    systemctl start docker
+    ok "Docker installed: $(docker --version)"
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+    install_docker
+else
+    ok "Docker already installed: $(docker --version)"
+fi
+
+CONTAINER_RUNTIME="docker"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
@@ -70,12 +152,6 @@ echo ""
 
 # ── Step 1: Detect OS ─────────────────────────────────────────────────────────
 log "Step 1/5 — Detecting platform..."
-
-OS_ID=""
-if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    OS_ID=$(. /etc/os-release && echo "${ID}")
-fi
 
 ok "Platform: ${OS_ID:-linux} / $(uname -m)"
 
@@ -269,27 +345,15 @@ log "Step 5/5 — Installing systemd service..."
 # Remove any old container so the service can always start fresh
 ${CONTAINER_RUNTIME} rm -f "${SERVICE_NAME}" 2>/dev/null || true
 
-# The collector image runs as UID 65532 (nonroot) — ensure it can write to the data dir
-chown -R 65532:65532 "$DATA_DIR" 2>/dev/null || true
-
 RUNTIME_BIN=$(command -v "${CONTAINER_RUNTIME}")
-
-# Build the After/Requires lines — podman needs no docker.service dependency
-if [[ "${CONTAINER_RUNTIME}" == "docker" ]]; then
-    UNIT_AFTER="network-online.target docker.service"
-    UNIT_REQUIRES="Requires=docker.service"
-else
-    UNIT_AFTER="network-online.target"
-    UNIT_REQUIRES=""
-fi
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=E2E Observability Agent
 Documentation=https://docs.e2enetworks.com/observability
-After=${UNIT_AFTER}
+After=network-online.target docker.service
 Wants=network-online.target
-${UNIT_REQUIRES}
+Requires=docker.service
 
 [Service]
 Type=simple
@@ -300,6 +364,7 @@ StartLimitIntervalSec=60
 StartLimitBurst=3
 ExecStartPre=-${RUNTIME_BIN} rm -f ${SERVICE_NAME}
 ExecStart=${RUNTIME_BIN} run --rm --name ${SERVICE_NAME} \
+  --user root \
   --env-file ${INSTALL_DIR}/env \
   --network host \
   --pid host \
