@@ -132,6 +132,10 @@ $(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
     esac
 
     systemctl enable docker --quiet
+    # Kill any stale dockerd process left from a partial install, then start clean
+    rm -f /var/run/docker.pid
+    pkill -x dockerd 2>/dev/null || true
+    sleep 1
     systemctl start docker
     ok "Docker installed: $(docker --version)"
 }
