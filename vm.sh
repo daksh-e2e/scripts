@@ -269,30 +269,6 @@ receivers:
         field: resource["host.name"]
         value: "${HOST_NAME}"
 
-  journald:
-    directory: /run/log/journal
-    priority: info
-    operators:
-      - type: copy
-        from: body.SYSLOG_IDENTIFIER
-        to: attributes["service.name"]
-        if: 'body["SYSLOG_IDENTIFIER"] != nil'
-      - type: copy
-        from: body.PRIORITY
-        to: attributes["syslog.priority"]
-        if: 'body["PRIORITY"] != nil'
-      - type: copy
-        from: body._SYSTEMD_UNIT
-        to: attributes["systemd.unit"]
-        if: 'body["_SYSTEMD_UNIT"] != nil'
-      - type: move
-        from: body.MESSAGE
-        to: body
-        if: 'body["MESSAGE"] != nil'
-      - type: add
-        field: resource["host.name"]
-        value: "${HOST_NAME}"
-
   prometheus/lustre:
     config:
       scrape_configs:
@@ -384,7 +360,7 @@ service:
       processors: [memory_limiter, resource/node, batch]
       exporters: [otlp/gateway]
     logs:
-      receivers: [journald, filelog/syslog, filelog/app]
+      receivers: [filelog/syslog, filelog/app]
       processors: [memory_limiter, resource/node, resource/logs_meta, batch]
       exporters: [otlp/gateway]
 YAML_EOF
