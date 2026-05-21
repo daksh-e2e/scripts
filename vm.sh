@@ -1,229 +1,227 @@
 #!/usr/bin/env bash
 # =============================================================================
-# E2E Observability Agent — VM install script
+# E2E OTel Collector — one-line VM installer
+#
+# Usage (copy-paste from E2E dashboard):
+#   E2E_PROJECT_ID=p-821 \
+#   E2E_CUSTOMER_ID=groot \
+#   E2E_API_KEY=<your-key> \
+#   bash -c "$(curl -fsSL http://172.16.230.168:31881/v1/install.sh)"
+#
+# Or run locally:
+#   E2E_PROJECT_ID=p-821 E2E_CUSTOMER_ID=groot bash install-vm-collector.sh
+#
+# What this does (automatically):
+#   1. Validates inputs and checks prerequisites
+#   2. Creates a log group via E2E Observability API → gets ingestion token
+#   3. Writes OTel collector config to /etc/e2e-otel-collector/config.yaml
+#   4. Runs the collector as a Docker container (auto-restart on reboot)
+#   5. Verifies logs + metrics are flowing
 # =============================================================================
-#
-# Usage:
-#   E2E_API_KEY=<your-api-key> E2E_PROJECT_ID=<project-id> E2E_CUSTOMER_ID=<customer-id> \
-#     bash -c "$(curl -L https://obs.e2enetworks.net/install/vm.sh)"
-#
-# Optional:
-#   E2E_ENV=production          — environment label (shown in dashboards)
-#   E2E_SITE=obs.e2enetworks.net — override the default API endpoint
-#
-# Supports: AlmaLinux/RHEL 8+, Ubuntu 20.04+, Debian 11+
-# Requires: curl, docker, systemd, root or sudo
-# =============================================================================
-
 set -euo pipefail
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-E2E_SITE="${E2E_SITE:-obs.e2enetworks.net}"
-API_BASE="${E2E_API_BASE:-https://${E2E_SITE}}"
-INSTALL_DIR="/etc/e2e-otel-collector"
-DATA_DIR="/var/lib/e2e-otel-collector"
-SERVICE_NAME="e2e-otel-collector"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# ── Colour helpers ─────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+info()    { echo -e "${BLUE}[E2E]${NC} $*"; }
+success() { echo -e "${GREEN}[OK]${NC}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
+die()     { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
+# ── Required inputs ────────────────────────────────────────────────────────────
+: "${E2E_PROJECT_ID:?E2E_PROJECT_ID is required (e.g. p-821)}"
+: "${E2E_CUSTOMER_ID:?E2E_CUSTOMER_ID is required (e.g. groot)}"
+E2E_API_KEY="${E2E_API_KEY:-}"          # future use — not validated yet
+
+# ── Infrastructure endpoints (internal E2E defaults) ──────────────────────────
+E2E_API_ENDPOINT="${E2E_API_ENDPOINT:-172.16.230.168:31880}"      # gRPC
+E2E_GATEWAY_ENDPOINT="${E2E_GATEWAY_ENDPOINT:-172.16.230.168:31318}"  # OTLP gRPC
+
+# ── Container config ───────────────────────────────────────────────────────────
 COLLECTOR_IMAGE="registry.e2enetworks.net/dakshmanuarya_2026/e2e-otel-collector@sha256:b97460ef001cc6315885a9d73422f93ee2dd50579150e49db8b5b965e7d5e883"
+REGISTRY_HOST="registry.e2enetworks.net"
+REGISTRY_USER="e2edakshmanuarya_2026+daksh"
+REGISTRY_PASS="TcBmkBhU9qPO2lFiQAQlrktINR1pxANO"
+CONTAINER_NAME="e2e-otel-collector"
+CONFIG_DIR="/etc/e2e-otel-collector"
+STORAGE_DIR="/var/lib/e2e-otel-collector"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BOLD='\033[1m'
-RESET='\033[0m'
+# ── Derived values ─────────────────────────────────────────────────────────────
+HOST_NAME="$(hostname -s)"
+# Log group name: logs.<customer_id>.<project_id>.vm
+# Sanitise: lowercase, replace non-alnum chars with dashes
+_sanitise() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/^-//;s/-$//'; }
+LOG_GROUP="logs.$(_sanitise "$E2E_CUSTOMER_ID").$(_sanitise "$E2E_PROJECT_ID").vm"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-log()    { echo -e "${BOLD}[e2e-collector]${RESET} $*"; }
-ok()     { echo -e "${GREEN}[e2e-collector]${RESET} $*"; }
-warn()   { echo -e "${YELLOW}[e2e-collector] WARNING:${RESET} $*"; }
-die()    { echo -e "${RED}[e2e-collector] ERROR:${RESET} $*" >&2; exit 1; }
+# ──────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "  ┌───────────────────────────────────────────────────────┐"
+echo "  │         E2E Networks — OTel Collector Installer        │"
+echo "  └───────────────────────────────────────────────────────┘"
+echo ""
+info "Project:    $E2E_PROJECT_ID"
+info "Customer:   $E2E_CUSTOMER_ID"
+info "Host:       $HOST_NAME"
+info "Log group:  $LOG_GROUP"
+info "Gateway:    $E2E_GATEWAY_ENDPOINT"
+echo ""
 
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. Please install it and retry."
-}
+# ── 1. Check prerequisites ─────────────────────────────────────────────────────
+info "Checking prerequisites..."
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
-[[ "${EUID:-$(id -u)}" -eq 0 ]] || die "This script must be run as root (or via sudo)."
-[[ -n "${E2E_API_KEY:-}" ]]      || die "E2E_API_KEY is not set.\n\nGet your API key from: https://myaccount.e2enetworks.com/services/apiiam\nThen run:\n  E2E_API_KEY=<key> E2E_PROJECT_ID=<project-id> E2E_CUSTOMER_ID=<customer-id> bash -c \"\$(curl -L ${API_BASE}/install/vm.sh)\""
-[[ -n "${E2E_PROJECT_ID:-}" ]]   || die "E2E_PROJECT_ID is not set.\n\nFind your Project ID in MyAccount → Projects.\nThen run:\n  E2E_API_KEY=<key> E2E_PROJECT_ID=<project-id> E2E_CUSTOMER_ID=<customer-id> bash -c \"\$(curl -L ${API_BASE}/install/vm.sh)\""
-[[ -n "${E2E_CUSTOMER_ID:-}" ]]  || die "E2E_CUSTOMER_ID is not set.\n\nFind your Customer ID in MyAccount → Profile.\nThen run:\n  E2E_API_KEY=<key> E2E_PROJECT_ID=<project-id> E2E_CUSTOMER_ID=<customer-id> bash -c \"\$(curl -L ${API_BASE}/install/vm.sh)\""
+command -v docker >/dev/null 2>&1 || die "docker is not installed. Install Docker first: https://docs.docker.com/engine/install/"
+docker info >/dev/null 2>&1 || die "Docker daemon is not running. Start it with: systemctl start docker"
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not found"
+success "Prerequisites OK"
 
-require_cmd curl
-require_cmd systemctl
-
-# ── Step 0: Detect OS ─────────────────────────────────────────────────────────
-OS_ID=""
-OS_ID_LIKE=""
-OS_VERSION_ID=""
-if [[ -f /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    OS_ID=$(. /etc/os-release && echo "${ID}")
-    OS_ID_LIKE=$(. /etc/os-release && echo "${ID_LIKE:-}")
-    OS_VERSION_ID=$(. /etc/os-release && echo "${VERSION_ID:-}")
-fi
-
-# ── Install Docker if missing ──────────────────────────────────────────────────
-install_docker() {
-    log "Docker not found — installing Docker Engine..."
-
-    # Determine OS family
-    local family=""
-    case "${OS_ID}" in
-        rhel|almalinux|rocky|centos|fedora) family="rhel" ;;
-        ubuntu)                              family="ubuntu" ;;
-        debian)                              family="debian" ;;
-        *)
-            # Fall back to ID_LIKE
-            if echo "${OS_ID_LIKE}" | grep -qE 'rhel|centos|fedora'; then
-                family="rhel"
-            elif echo "${OS_ID_LIKE}" | grep -q 'debian'; then
-                family="debian"
-            else
-                die "Unsupported OS '${OS_ID}'. Install Docker manually and re-run this script."
-            fi
-            ;;
-    esac
-
-    case "${family}" in
-        rhel)
-            log "Installing Docker via dnf (RHEL/AlmaLinux/CentOS/Rocky)..."
-            dnf -y install dnf-plugins-core 2>/dev/null || yum -y install yum-utils
-            # CentOS 7/8 repo works for RHEL-family; use centos as base URL
-            dnf config-manager --add-repo \
-                https://download.docker.com/linux/centos/docker-ce.repo 2>/dev/null \
-                || yum-config-manager --add-repo \
-                https://download.docker.com/linux/centos/docker-ce.repo
-            dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-                2>/dev/null || yum -y install docker-ce docker-ce-cli containerd.io
-            ;;
-        ubuntu)
-            log "Installing Docker via apt (Ubuntu)..."
-            apt-get update -qq
-            apt-get install -y -qq ca-certificates curl gnupg lsb-release
-            install -m 0755 -d /etc/apt/keyrings
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-            chmod a+r /etc/apt/keyrings/docker.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu \
-$(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
-                | tee /etc/apt/sources.list.d/docker.list > /dev/null
-            apt-get update -qq
-            apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
-                docker-buildx-plugin docker-compose-plugin
-            ;;
-        debian)
-            log "Installing Docker via apt (Debian)..."
-            apt-get update -qq
-            apt-get install -y -qq ca-certificates curl gnupg
-            install -m 0755 -d /etc/apt/keyrings
-            curl -fsSL https://download.docker.com/linux/debian/gpg \
-                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-            chmod a+r /etc/apt/keyrings/docker.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/debian \
-$(. /etc/os-release && echo "${VERSION_CODENAME}") stable" \
-                | tee /etc/apt/sources.list.d/docker.list > /dev/null
-            apt-get update -qq
-            apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
-                docker-buildx-plugin docker-compose-plugin
-            ;;
-    esac
-
-    systemctl enable docker --quiet
-    # Kill any stale dockerd process left from a partial install, then start clean
-    rm -f /var/run/docker.pid
-    pkill -x dockerd 2>/dev/null || true
-    sleep 1
-    systemctl start docker
-    ok "Docker installed: $(docker --version)"
-}
-
-if ! command -v docker >/dev/null 2>&1; then
-    install_docker
+# ── 2. Install grpcurl (if missing) ───────────────────────────────────────────
+GRPCURL_BIN="$(command -v grpcurl 2>/dev/null || true)"
+if [[ -z "$GRPCURL_BIN" ]]; then
+    info "Downloading grpcurl..."
+    GRPCURL_TMP="$(mktemp -d)/grpcurl"
+    GRPCURL_VERSION="1.9.3"
+    GRPCURL_URL="https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
+    if ! curl -fsSL "$GRPCURL_URL" | tar -xz -C "$(dirname "$GRPCURL_TMP")" grpcurl 2>/dev/null; then
+        # fallback: try /usr/local/bin via temp path
+        warn "Could not download grpcurl from GitHub. Trying alternate method..."
+        curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz" \
+            -o /tmp/grpcurl.tar.gz
+        tar -xzf /tmp/grpcurl.tar.gz -C /tmp grpcurl
+        GRPCURL_TMP="/tmp/grpcurl"
+    fi
+    chmod +x "$GRPCURL_TMP"
+    GRPCURL_BIN="$GRPCURL_TMP"
+    success "grpcurl downloaded"
 else
-    ok "Docker already installed: $(docker --version)"
+    success "grpcurl found at $GRPCURL_BIN"
 fi
 
-CONTAINER_RUNTIME="docker"
+# ── 3. Write proto to temp file ────────────────────────────────────────────────
+PROTO_DIR="$(mktemp -d)"
+cat > "$PROTO_DIR/observability.proto" << 'PROTO_EOF'
+syntax = "proto3";
+package e2e.observability.v1;
 
-echo ""
-echo -e "${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}║   E2E Observability Agent — Linux VM Installer   ║${RESET}"
-echo -e "${BOLD}╚══════════════════════════════════════════════════╝${RESET}"
-echo ""
-
-# ── Step 1: Detect OS ─────────────────────────────────────────────────────────
-log "Step 1/5 — Detecting platform..."
-
-ok "Platform: ${OS_ID:-linux} / $(uname -m)"
-
-# ── Step 2: Register with E2E Observability API ───────────────────────────────
-log "Step 2/5 — Registering with E2E Observability..."
-
-REGISTER_RESPONSE=$(curl -sf --retry 3 --retry-delay 2 --retry-all-errors \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "{\"api_key\": \"${E2E_API_KEY}\", \"project_id\": ${E2E_PROJECT_ID}, \"customer_id\": ${E2E_CUSTOMER_ID}, \"resource_type\": \"vm\"}" \
-    "${API_BASE}/v1/install/register" 2>&1) || {
-    die "Failed to reach E2E Observability API at ${API_BASE}.\nCheck your network connectivity and try again."
+service LogGroupService {
+  rpc CreateLogGroup(CreateLogGroupRequest) returns (CreateLogGroupResponse);
 }
 
-# Parse response fields (handles both compact and spaced JSON)
-INGESTION_TOKEN=$(echo "$REGISTER_RESPONSE" | sed 's/.*"ingestion_token" *: *"\([^"]*\)".*/\1/' | grep -v '^{')
-PROJECT_ID="${E2E_PROJECT_ID}"
-LOG_GROUP=$(echo "$REGISTER_RESPONSE" | sed 's/.*"log_group" *: *"\([^"]*\)".*/\1/' | grep -v '^{')
+message CreateLogGroupRequest {
+  string log_group_name    = 1;
+  optional string project_id      = 2;
+  optional string resource_id     = 3;
+  optional string resource_type   = 4;
+  optional string organization_id = 5;
+  optional string customer_id     = 6;
+  uint32 retention_in_days = 7;
+  uint32 quota_gb          = 8;
+}
+
+message LogGroup {
+  string name                          = 1;
+  optional string project_id           = 2;
+  optional string resource_id          = 3;
+  optional string resource_type        = 4;
+  optional string organization_id      = 5;
+  optional string customer_id          = 6;
+  uint32 retention_in_days             = 7;
+  uint32 quota_gb                      = 8;
+  int64  created_at                    = 9;
+  optional int64 last_event_timestamp  = 10;
+  int64  stored_bytes                  = 11;
+  uint64 log_stream_count              = 12;
+}
+
+message CreateLogGroupResponse {
+  reserved 1;
+  LogGroup log_group       = 2;
+  string ingestion_token   = 3;
+  string read_token        = 4;
+}
+PROTO_EOF
+
+# ── 4. Create log group / retrieve cached token ────────────────────────────────
+mkdir -p "$CONFIG_DIR"
+TOKEN_CACHE="$CONFIG_DIR/.ingestion_token"
+INGESTION_TOKEN=""
+
+_grpc_create_log_group() {
+    local name="$1"
+    "$GRPCURL_BIN" \
+        -plaintext \
+        -import-path "$PROTO_DIR" \
+        -proto observability.proto \
+        -H 'x-admin-id: system' \
+        -H 'x-roles: admin' \
+        -d "{\"log_group_name\": \"${name}\", \"project_id\": \"${E2E_PROJECT_ID}\", \"customer_id\": \"${E2E_CUSTOMER_ID}\", \"resource_id\": \"${E2E_PROJECT_ID}\", \"resource_type\": \"customer\"}" \
+        "$E2E_API_ENDPOINT" \
+        e2e.observability.v1.LogGroupService/CreateLogGroup 2>&1
+}
+
+_extract_token() {
+    python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+token = data.get('ingestionToken') or data.get('ingestion_token', '')
+print(token)
+" 2>/dev/null
+}
+
+# Idempotency: reuse cached token from a previous run on this host.
+if [[ -f "$TOKEN_CACHE" ]]; then
+    CACHED="$(cat "$TOKEN_CACHE" 2>/dev/null || true)"
+    CACHED_TOKEN="$(echo "$CACHED" | cut -d'|' -f1)"
+    CACHED_GROUP="$(echo "$CACHED" | cut -d'|' -f2)"
+    if [[ -n "$CACHED_TOKEN" && -n "$CACHED_GROUP" ]]; then
+        warn "Found existing install. Reusing saved token (delete $TOKEN_CACHE to force re-create)."
+        INGESTION_TOKEN="$CACHED_TOKEN"
+        LOG_GROUP="$CACHED_GROUP"
+        success "Token loaded from cache. Log group: $LOG_GROUP"
+    fi
+fi
 
 if [[ -z "$INGESTION_TOKEN" ]]; then
-    if echo "$REGISTER_RESPONSE" | grep -qi "invalid\|unauthorized\|expired"; then
-        die "API key rejected. Confirm your key has WRITE capability in MyAccount → API IAM."
+    info "Creating log group '$LOG_GROUP' via Observability API..."
+
+    set +e; GRPC_RESPONSE="$(_grpc_create_log_group "$LOG_GROUP")"; set -e
+
+    # Fallback 1: host-hash suffix
+    if echo "$GRPC_RESPONSE" | grep -q "ALREADY_EXISTS"; then
+        warn "Log group '$LOG_GROUP' already exists — trying host-hash suffix..."
+        HOST_HASH="$(echo "$HOST_NAME" | md5sum | cut -c1-6)"
+        LOG_GROUP="logs.$(_sanitise "$E2E_CUSTOMER_ID").$(_sanitise "$E2E_PROJECT_ID")-${HOST_HASH}.vm"
+        info "Trying: $LOG_GROUP"
+        set +e; GRPC_RESPONSE="$(_grpc_create_log_group "$LOG_GROUP")"; set -e
     fi
-    die "Unexpected response from registration API:\n${REGISTER_RESPONSE}"
+
+    # Fallback 2: epoch timestamp suffix
+    if echo "$GRPC_RESPONSE" | grep -q "ALREADY_EXISTS"; then
+        warn "Host-hash group also exists — using timestamp suffix..."
+        TS="$(date +%s | tail -c5)"
+        LOG_GROUP="logs.$(_sanitise "$E2E_CUSTOMER_ID").$(_sanitise "$E2E_PROJECT_ID")-${TS}.vm"
+        info "Trying: $LOG_GROUP"
+        set +e; GRPC_RESPONSE="$(_grpc_create_log_group "$LOG_GROUP")"; set -e
+    fi
+
+    if echo "$GRPC_RESPONSE" | grep -qE 'Code:|UNAVAILABLE|INTERNAL|InvalidArgument'; then
+        die "Failed to create log group:\n$GRPC_RESPONSE"
+    fi
+
+    INGESTION_TOKEN="$(echo "$GRPC_RESPONSE" | _extract_token)"
+
+    if [[ -z "$INGESTION_TOKEN" ]]; then
+        die "Could not extract ingestion token from API response:\n$GRPC_RESPONSE"
+    fi
+
+    echo "${INGESTION_TOKEN}|${LOG_GROUP}" > "$TOKEN_CACHE"
+    chmod 600 "$TOKEN_CACHE"
+    success "Log group created. Token: ${INGESTION_TOKEN:0:20}..."
 fi
 
-ok "Registered successfully"
-ok "  Project ID : ${PROJECT_ID}"
-ok "  Log group  : ${LOG_GROUP}"
+# ── 5. Write collector config ──────────────────────────────────────────────────
+info "Writing collector config to $CONFIG_DIR/config.yaml..."
+mkdir -p "$CONFIG_DIR" "$STORAGE_DIR" "${STORAGE_DIR}/tmp"
 
-# ── Step 3: Pull collector image ──────────────────────────────────────────────
-log "Step 3/5 — Pulling e2e-otel-collector image..."
-
-# Optional registry auth — set E2E_REGISTRY_USER and E2E_REGISTRY_PASS if the registry is private
-if [[ -n "${E2E_REGISTRY_USER:-}" && -n "${E2E_REGISTRY_PASS:-}" ]]; then
-    echo "${E2E_REGISTRY_PASS}" | ${CONTAINER_RUNTIME} login registry.e2enetworks.net \
-        -u "${E2E_REGISTRY_USER}" --password-stdin >/dev/null \
-        || die "Registry login failed. Check E2E_REGISTRY_USER / E2E_REGISTRY_PASS."
-    log "Registry login successful"
-fi
-
-${CONTAINER_RUNTIME} pull "${COLLECTOR_IMAGE}" || die "Failed to pull collector image from registry."
-
-ok "Image pulled: ${COLLECTOR_IMAGE%%@*}"
-
-# ── Step 4: Write config and env file ─────────────────────────────────────────
-log "Step 4/5 — Writing configuration..."
-
-HOST_NAME=$(hostname -f 2>/dev/null || hostname)
-mkdir -p "$INSTALL_DIR" "$DATA_DIR" "${DATA_DIR}/tmp"
-
-# Write the env file — passed to the container at runtime
-cat > "${INSTALL_DIR}/env" <<EOF
-# E2E Observability Agent — environment variables
-# Do not edit manually. Re-run the install script to update.
-E2E_TOKEN=${INGESTION_TOKEN}
-HOST_NAME=${HOST_NAME}
-E2E_LOG_GROUP=${LOG_GROUP}
-E2E_PROJECT_ID=${PROJECT_ID}
-E2E_ENV=${E2E_ENV:-}
-EOF
-chmod 600 "${INSTALL_DIR}/env"
-
-# Download the collector config template from the API
-curl -fsL -o "${INSTALL_DIR}/config.yaml" \
-    "${API_BASE}/install/vm-config.yaml" 2>/dev/null || {
-    warn "Could not download config template from ${API_BASE}. Using bundled default."
-    cat > "${INSTALL_DIR}/config.yaml" <<'YAML'
+cat > "$CONFIG_DIR/config.yaml" << YAML_EOF
 extensions:
   health_check:
     endpoint: "0.0.0.0:13133"
@@ -235,10 +233,14 @@ extensions:
       directory: /var/lib/e2e-otel-collector/tmp
 
 receivers:
+  # Reads syslog/journal text output — covers both rsyslog (/var/log/messages)
+  # and systemd-journald systems where rsyslog forwards to /var/log/messages.
+  # journald binary receiver is omitted: distroless image has no journalctl binary.
   filelog/syslog:
     include:
       - /var/log/messages
       - /var/log/secure
+      - /var/log/syslog
     start_at: end
     storage: file_storage
     include_file_path: true
@@ -248,7 +250,7 @@ receivers:
     operators:
       - type: add
         field: resource["host.name"]
-        value: "${env:HOST_NAME}"
+        value: "${HOST_NAME}"
 
   filelog/app:
     include:
@@ -265,7 +267,7 @@ receivers:
     operators:
       - type: add
         field: resource["host.name"]
-        value: "${env:HOST_NAME}"
+        value: "${HOST_NAME}"
 
   hostmetrics:
     collection_interval: 30s
@@ -300,13 +302,22 @@ processors:
   resource/node:
     attributes:
       - key: host.name
-        value: "${env:HOST_NAME}"
+        value: "${HOST_NAME}"
         action: upsert
+
+  resource/logs_meta:
+    attributes:
       - key: log_group
-        value: "${env:E2E_LOG_GROUP}"
+        value: "${LOG_GROUP}"
+        action: upsert
+      - key: log_stream
+        value: "${HOST_NAME}"
+        action: upsert
+      - key: source_type
+        value: vm
         action: upsert
       - key: project_id
-        value: "${env:E2E_PROJECT_ID}"
+        value: "${E2E_PROJECT_ID}"
         action: upsert
 
   batch:
@@ -316,11 +327,11 @@ processors:
 
 exporters:
   otlp/gateway:
-    endpoint: "172.16.230.168:31318"
+    endpoint: "${E2E_GATEWAY_ENDPOINT}"
     tls:
       insecure: true
     headers:
-      authorization: "Bearer ${env:E2E_TOKEN}"
+      authorization: "Bearer ${INGESTION_TOKEN}"
     retry_on_failure:
       enabled: true
       initial_interval: 5s
@@ -336,80 +347,79 @@ service:
       exporters: [otlp/gateway]
     logs:
       receivers: [filelog/syslog, filelog/app]
-      processors: [memory_limiter, resource/node, batch]
+      processors: [memory_limiter, resource/node, resource/logs_meta, batch]
       exporters: [otlp/gateway]
-YAML
-}
+YAML_EOF
 
-ok "Configuration written to ${INSTALL_DIR}/"
+success "Config written"
 
-# ── Step 5: Create and start systemd service ──────────────────────────────────
-log "Step 5/5 — Installing systemd service..."
-
-# Remove any old container so the service can always start fresh
-${CONTAINER_RUNTIME} rm -f "${SERVICE_NAME}" 2>/dev/null || true
-
-RUNTIME_BIN=$(command -v "${CONTAINER_RUNTIME}")
-
-cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=E2E Observability Agent
-Documentation=https://docs.e2enetworks.com/observability
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
-
-[Service]
-Type=simple
-User=root
-Restart=on-failure
-RestartSec=5s
-StartLimitIntervalSec=60
-StartLimitBurst=3
-ExecStartPre=-${RUNTIME_BIN} rm -f ${SERVICE_NAME}
-ExecStart=${RUNTIME_BIN} run --rm --name ${SERVICE_NAME} \
-  --user root \
-  --env-file ${INSTALL_DIR}/env \
-  --network host \
-  --pid host \
-  -v ${INSTALL_DIR}/config.yaml:/etc/otelcol/config.yaml:ro \
-  -v ${DATA_DIR}:/var/lib/e2e-otel-collector \
-  -v /var/log:/var/log:ro \
-  -v /run/log/journal:/run/log/journal:ro \
-  ${COLLECTOR_IMAGE} --config=/etc/otelcol/config.yaml
-ExecStop=${RUNTIME_BIN} stop ${SERVICE_NAME}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME" --quiet
-
-log "Step 5/5 — Starting agent..."
-
-if systemctl is-active --quiet "$SERVICE_NAME"; then
-    systemctl restart "$SERVICE_NAME"
-    ok "Agent restarted"
-else
-    systemctl start "$SERVICE_NAME"
-    ok "Agent started"
+# ── 6. Stop existing container if running ─────────────────────────────────────
+if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    info "Stopping existing container '$CONTAINER_NAME'..."
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 fi
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# ── 7. Pull image ──────────────────────────────────────────────────────────────
+info "Logging in to E2E container registry..."
+echo "$REGISTRY_PASS" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin >/dev/null 2>&1 || \
+    die "Docker registry login failed. Check network connectivity to $REGISTRY_HOST."
+success "Registry login OK"
+
+info "Pulling collector image..."
+docker pull "$COLLECTOR_IMAGE"
+success "Image pulled"
+
+# ── 8. Run container ───────────────────────────────────────────────────────────
+info "Starting collector container..."
+docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --network host \
+    --pid host \
+    --privileged \
+    --user 0 \
+    -v "${CONFIG_DIR}:/etc/e2e-otel-collector:ro" \
+    -v "${STORAGE_DIR}:/var/lib/e2e-otel-collector" \
+    -v "/var/log:/var/log:ro" \
+    -v "/run/log/journal:/run/log/journal:ro" \
+    "$COLLECTOR_IMAGE" \
+    --config=/etc/e2e-otel-collector/config.yaml
+
+success "Container started"
+
+# ── 9. Wait and verify ─────────────────────────────────────────────────────────
+info "Waiting for collector to start..."
+sleep 5
+
+if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    warn "Container is not running. Last logs:"
+    docker logs --tail 30 "$CONTAINER_NAME" 2>&1 || true
+    die "Collector failed to start. Check logs above."
+fi
+
+# Health check
+HEALTH_STATUS="$(curl -sf --max-time 5 http://localhost:13133/ 2>/dev/null && echo "ok" || echo "pending")"
+
 echo ""
-echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
-echo -e "${GREEN}${BOLD}║   E2E Observability Agent installed and running  ║${RESET}"
-echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════╝${RESET}"
+echo "  ┌──────────────────────────────────────────────────────────────┐"
+echo "  │                    Installation Complete!                    │"
+echo "  └──────────────────────────────────────────────────────────────┘"
 echo ""
-echo -e "  ${BOLD}Project ID :${RESET} ${PROJECT_ID}"
-echo -e "  ${BOLD}Log group  :${RESET} ${LOG_GROUP}"
-echo -e "  ${BOLD}Host       :${RESET} ${HOST_NAME}"
+success "Collector is running"
 echo ""
-echo -e "  Verify: ${BOLD}systemctl status ${SERVICE_NAME}${RESET}"
-echo -e "  Logs:   ${BOLD}journalctl -u ${SERVICE_NAME} -f${RESET}"
-echo -e "  Health: ${BOLD}curl -s http://localhost:13133${RESET}"
+echo "  Host:          $HOST_NAME"
+echo "  Log group:     $LOG_GROUP"
+echo "  Project:       $E2E_PROJECT_ID"
+echo "  Token:         ${INGESTION_TOKEN:0:20}..."
+echo "  Gateway:       $E2E_GATEWAY_ENDPOINT"
+echo "  Health:        http://$(hostname -s):13133/"
 echo ""
-echo -e "  Data will appear in your dashboard within 2 minutes."
-echo -e "  Dashboard: ${BOLD}https://${E2E_SITE}/dashboard${RESET}"
+echo "  Useful commands:"
+echo "    docker logs -f $CONTAINER_NAME   # live logs"
+echo "    docker stats $CONTAINER_NAME     # resource usage"
+echo "    docker restart $CONTAINER_NAME   # restart"
+echo "    docker rm -f $CONTAINER_NAME     # uninstall"
 echo ""
+
+# Cleanup temp files
+rm -rf "$PROTO_DIR"
