@@ -23,7 +23,7 @@ set -euo pipefail
 # ── Constants ──────────────────────────────────────────────────────────────────
 E2E_SITE="${E2E_SITE:-obs.e2enetworks.net}"
 API_BASE="${E2E_API_BASE:-https://${E2E_SITE}}"
-COLLECTOR_VERSION="${E2E_COLLECTOR_VERSION:-0.10.0}"
+COLLECTOR_VERSION="${E2E_COLLECTOR_VERSION:-0.152.1}"
 CDN_BASE="https://observability.objectstore.e2enetworks.net"
 
 INSTALL_DIR="/etc/e2e-otel-collector"
