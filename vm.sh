@@ -10,6 +10,7 @@
 # Optional env vars:
 #   E2E_ENV=production                       — environment label (shown in dashboards)
 #   E2E_SITE=obs.e2enetworks.net             — override the default API endpoint
+#   E2E_API_BASE=http://172.16.230.168:31881 — override the API base URL (testing)
 #   E2E_COLLECTOR_VERSION=0.10.0             — pin a specific collector version
 #   E2E_BINARY_URL=http://host:port/otelcol  — use a custom binary URL (testing)
 #
@@ -23,6 +24,7 @@ set -euo pipefail
 E2E_SITE="${E2E_SITE:-obs.e2enetworks.net}"
 API_BASE="${E2E_API_BASE:-https://${E2E_SITE}}"
 COLLECTOR_VERSION="${E2E_COLLECTOR_VERSION:-0.10.0}"
+CDN_BASE="https://observability.objectstore.e2enetworks.net"
 
 INSTALL_DIR="/etc/e2e-otel-collector"
 DATA_DIR="/var/lib/e2e-otel-collector"
@@ -97,7 +99,7 @@ ok "Registered — project ${E2E_PROJECT_ID}, log group ${LOG_GROUP}"
 # ── Step 3: Download collector binary ─────────────────────────────────────────
 log "Step 3/4 — Downloading E2E OTel Collector v${COLLECTOR_VERSION} (${ARCH})..."
 
-BINARY_URL="${E2E_BINARY_URL:-${API_BASE}/install/otelcol-linux-${ARCH}}"
+BINARY_URL="${E2E_BINARY_URL:-${CDN_BASE}/collector/otelcol-linux-${ARCH}}"
 
 # Try configured URL first; fall back to the upstream otelcol-contrib release
 if ! curl -fsSL --retry 3 --retry-delay 2 -o "${BINARY_PATH}.tmp" "${BINARY_URL}" 2>/dev/null; then
